@@ -21,5 +21,13 @@ Next, run the following command in your terminal:
 uv run client.py server.py
 ```
 
-
+You can login with the following username: 
+```python
+[
+  {"username": "joe", "role": "parent"},
+  {"username": "jane", "role": "parent"},
+  {"username": "henry", "role": "child"},
+  {"username": "rose", "role": "child"}
+]
+```
 
