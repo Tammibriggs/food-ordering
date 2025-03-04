@@ -1,4 +1,4 @@
-from typing import Any
+from typing import List, Tuple, Optional
 import httpx
 import aiosqlite
 import asyncio
@@ -7,16 +7,20 @@ from mcp.server.fastmcp import FastMCP
 from permit import Permit
 from dotenv import load_dotenv
 import os
-import re
-import unicodedata
+import json
 
 load_dotenv()  # load environment variables from .env
 
-MAX_ALLOWED_DISH_PRICE = 10
+MAX_ALLOWED_DISH_PRICE = 10 # 10 dollar
 DB_NAME = "food_ordering.db"
-PROJECT_ID = os.getenv("PROJECT_ID")
-ENV_ID = os.getenv("PERMIT_API_KEY")
-ELEMENTS_CONFIG_ID = os.getenv("ELEMENTS_CONFIG_ID")
+TENANT = 'default'
+
+LOCAL_PDP_URL=  os.getenv("LOCAL_PDP_URL") 
+PERMIT_API_KEY = os.getenv("PERMIT_API_KEY")
+PROJECT_ID = os.getenv('PROJECT_ID') 
+ENV_ID = os.getenv('ENV_ID') 
+ACCESS_ELEMENTS_CONFIG_ID = os.getenv('ACCESS_ELEMENTS_CONFIG_ID')
+OPERATION_ELEMENTS_CONFIG_ID = os.getenv('OPERATION_ELEMENTS_CONFIG_ID')
 
 # Initialize FastMCP server
 mcp = FastMCP("food_ordering")
@@ -26,19 +30,9 @@ conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
 
 permit = Permit(
-    pdp="https://cloudpdp.api.permit.io",  
-    token= ENV_ID,
+  pdp=LOCAL_PDP_URL,  
+  token= PERMIT_API_KEY,
 )
-
-def slugify(text):
-  """
-  Converts a string to a URL-friendly slug.
-  """
-  text = unicodedata.normalize('NFKD', text) 
-  text = text.encode('ascii', 'ignore').decode('utf-8')  
-  text = re.sub(r'[^\w\s-]', '', text).lower() 
-  text = re.sub(r'\s+', '-', text).strip() 
-  return text
 
 async def init_db():
   async with aiosqlite.connect(DB_NAME) as db:
@@ -74,7 +68,7 @@ async def init_db():
     if row[0] == 0:
       # Populate the users table.
       users_data = [
-        ("jacob", "parent"),
+        ("joe", "parent"),
         ("jane", "parent"),
         ("henry", "child"),
         ("rose", "child"),
@@ -138,19 +132,18 @@ async def init_db():
         permit.api.resource_instances.create({
           "resource": "restaurants",
           "key": restaurant[0],
-          "tenant": "default",
+          "tenant": TENANT,
         })
         for restaurant in restaurants
       ])
 
-      
       # Retrieve the users to synchronize with Permit.io.
       cursor = await db.execute("SELECT id, username, role FROM users")
       users = await cursor.fetchall()
 
       await asyncio.gather(*[
         permit.api.sync_user({
-          "key": slugify(user[1]),
+          "key": user[1],
         })
         for user in users
       ])
@@ -163,9 +156,18 @@ async def init_db():
         if role == "parent":
           await permit.api.role_assignments.bulk_assign([
             {
-              "user": slugify(username),
+              "user": username,
               "role": "parent",
-              "tenant": "default",
+              "tenant": TENANT,
+              "resource_instance": f"restaurants:{r[0]}",
+            }
+            for r in restaurants
+          ])
+          await permit.api.role_assignments.bulk_assign([
+            {
+              "user": username,
+              "role": "_Reviewer_",
+              "tenant": TENANT,
               "resource_instance": f"restaurants:{r[0]}",
             }
             for r in restaurants
@@ -173,15 +175,14 @@ async def init_db():
         elif role == "child":
           await permit.api.role_assignments.bulk_assign([
             {
-              "user": slugify(username),
+              "user": username,
               "role": "child-can-order",
-              "tenant": "default",
+              "tenant": TENANT,
               "resource_instance": f"restaurants:{r[0]}",
             }
             for r in children_restaurants
           ]) 
-    await db.commit()
-    return 'working'
+    return await db.commit()
     
 async def get_restaurant_by_name(restaurant_name: str) -> dict:
   """
@@ -194,15 +195,15 @@ async def get_restaurant_by_name(restaurant_name: str) -> dict:
       await cursor.close()
 
   if row:
-      return {
-          "id": row[0],
-          "name": row[1],
-          "allowed_for_children": bool(row[2])
-      }
+    return {
+      "id": row[0],
+      "name": row[1],
+      "allowed_for_children": bool(row[2])
+    }
   return None
 
 @mcp.tool()
-async def verify_access(username: str) -> bool:
+async def verify_access(username: str) -> Optional[str]:
   """
   To check if a user has access to the system after they provide their username.
   
@@ -210,49 +211,48 @@ async def verify_access(username: str) -> bool:
     username: The username to check.
   """
   async with aiosqlite.connect(DB_NAME) as db:
-    query = "SELECT COUNT(*) FROM users WHERE username = ?"
+    query = "SELECT role FROM users WHERE username = ?"
     cursor = await db.execute(query, (username,))
     result = await cursor.fetchone()
+    
     await cursor.close()
 
-  if result and result[0] > 0:
-    return True
-  return False
+  if not result:
+    return 
+  return result[0]
 
 @mcp.tool()
-async def list_restaurants() -> str:
+async def list_restaurants() -> List[Tuple[str, int]]:
   """
   Lists available restaurants. 
-  If a restaurant is not for kids, the text "not for kids" is appended
-  to the restaurant's name.
+  If a restaurant is not for kids, the number 0 is after to the restaurant's name.
   """
   async with aiosqlite.connect(DB_NAME) as db:
-      cursor = await db.execute("SELECT id, name, allowed_for_children FROM restaurants")
+      cursor = await db.execute("SELECT name, allowed_for_children FROM restaurants")
       rows = await cursor.fetchall()
       await cursor.close()
   if not rows:
       return "No restaurants available."
   return rows
-    
-  # return "\n".join([f"- {row[2]}{' not for kids' if row[1] else ''}" for row in rows])
         
 @mcp.tool()
-async def list_dishes(username: str, restaurant_name: str) -> str:
+async def list_dishes(username: str, restaurant_name: str) ->  List[Tuple[str, int]]:
     """
-    Lists dishes for a given restaurant along with their price.
-    It also checks if the user is permitted to access the restaurant.
+    Lists the dishes available at a given restaurant along with their prices in dollars.
+    Dishes are only listed if the user has the necessary permissions to access the restaurant.
 
     Args:
-        username: The username of the user requesting dishes.
-        restaurant_name: The name of the restaurant.
+      username: The username of the user requesting dishes.
+      restaurant_name: The name of the restaurant.
     """
-    
+    username = username.lower()
     restaurant = await get_restaurant_by_name(restaurant_name)
+
     if not restaurant:
       return "Restaurant not found"
     
     # Check if user is permitted in the restaurant
-    permitted = permit.check(slugify(username), 'read', f"restaurants:{restaurant['id']}")
+    permitted = await permit.check(username, 'read', f"restaurants:{restaurant['id']}")
     if not permitted:
       return f"Access denied. You are not permitted to view dishes from this restaurant."
       
@@ -268,22 +268,20 @@ async def list_dishes(username: str, restaurant_name: str) -> str:
 
     if not dishes:
         return "No dishes available for this restaurant."
-
-    return "\n".join([f"- {name} (${price:.2f})" for name, price in dishes])
+      
+    return dishes
   
 @mcp.tool()
 async def order_dish(username: str, restaurant_name: str, dish_name: str) -> str:
   """
-  Processes an order for a dish. If the dish is above a specific price, a one-time approval request is required.
+  Processes an order for a dish.
 
   Args:
-      username: The username of the person ordering.
-      restaurant_name: The name of the restaurant.
-      dish_name: The name of the dish to order.
-
-  Returns:
-      str: Order confirmation or approval request message.
+    username: The username of the person ordering.
+    restaurant_name: The name of the restaurant.
+    dish_name: The name of the dish to order.
   """
+  username = username.lower()
   restaurant = await get_restaurant_by_name(restaurant_name)
   if not restaurant:
       return "Restaurant not found."
@@ -309,67 +307,71 @@ async def order_dish(username: str, restaurant_name: str, dish_name: str) -> str
       await user_cursor.close()
 
   # Check if user is permitted in the restaurant
-  permitted = await permit.check(slugify(username), "operate", f"restaurants:{restaurant['id']}")
+  permitted = await permit.check(username, "operate", f"restaurants:{restaurant['id']}")
 
   # Apply price restriction for children
   if user[0] == "child" and dish[0] > MAX_ALLOWED_DISH_PRICE and not permitted:
       return (
           f"This dish costs ${dish[0]:.2f}, and you can only order dishes less than "
-          f"${MAX_ALLOWED_DISH_PRICE:.2f}. To order this dish, you need to request approval."
+          f"${MAX_ALLOWED_DISH_PRICE:.2f}. To order this dish, you need to request an approval."
       )
 
+  if permitted: 
+    await permit.api.users.unassign_role({"user": username,  "role": "_Approved_", "resource_instance": f"restaurants:{restaurant['id']}", "tenant": TENANT})
+    
   return f"Order successfully placed for {dish_name} from {restaurant_name}!"
   
 
 @mcp.tool()
 async def request_restaurant_access(username: str, restaurant_name: str) -> dict:
   """
-  To requests permanent access to a restaurant.
+  To request for parent's approval to be able to access a restaurant in order to view it's dishes.
 
   Args:
     username: The username of the person requesting access.
     restaurant_name: The name of the restaurant to request access for.
-
   """
-  
-  login = await permit.elements.login_as({ "userId": slugify(username), "tenant": "default"})
-  print(login)
-  
+ 
+  username = username.lower()  
   restaurant = await get_restaurant_by_name(restaurant_name)
   if not restaurant:
-      return "Restaurant not found."
+    return "Restaurant not found."
     
-  url = f"https://api.permit.io/v2/facts/{PROJECT_ID}/{ENV_ID}/access_requests/{ELEMENTS_CONFIG_ID}/user/{slugify(username)}/tenant/default"
+  url = f"https://api.permit.io/v2/facts/{PROJECT_ID}/{ENV_ID}/access_requests/{ACCESS_ELEMENTS_CONFIG_ID}/user/{username}/tenant/{TENANT}"
   payload = {
-      "access_request_details": {
-          "tenant": "default",
-          "resource": "restaurants",
-          "resource_instance": restaurant['id'],
-          "role": 'child-can-order',
-      },
-      "reason": f"User {username} requests role {'child-can-order'} for {restaurant['name']} restaurant"
+    "access_request_details": {
+      "tenant": TENANT,
+      "resource": "restaurants",
+      "resource_instance": restaurant['id'],
+      "role": 'child-can-order',
+    },
+    "reason": f"User {username} requests role {'child-can-order'} for {restaurant['name']} restaurant"
   }
+  
   headers = {
-      "authorization": "Bearer YOUR_API_SECRET_KEY",
+      "authorization": f"Bearer {PERMIT_API_KEY}",
       "Content-Type": "application/json",
   }
   async with httpx.AsyncClient() as client:
-      await client.post(url, json=payload, headers=headers)
-      return "Your request has been sent. Please check back later."
+    response = await client.post(url, json=payload, headers=headers)
+    if response.status_code >= 200 and response.status_code < 300:
+      return "Your request has been successfully sent. Please check back later."
+    else:
+      return f"Request failed with status code {response.status_code}: {response.text} {restaurant['id']}"
+
 
 @mcp.tool()
 async def request_dish_approval(username: str, dish_name) -> dict:
   """
-  To request a one-time approval to order a dish.
+  To request a one-time operation approval to order a dish.
 
   Args:
     username: The username of the person requesting access.
     dish_name: The name of the dish to request approval for.
   """
-  
-  login = await permit.elements.login_as({ "userId": slugify(username), "tenant": "default"})
-  print(login)
-  
+  username = username.lower()
+  login = await permit.elements.login_as(username, "default")
+
   async with aiosqlite.connect(DB_NAME) as db:
     query = """
         SELECT r.id 
@@ -381,26 +383,163 @@ async def request_dish_approval(username: str, dish_name) -> dict:
     restaurant = await cursor.fetchone()
     await cursor.close()
   
-  url = "https://api.permit.io/v2/elements/{PROJECT_ID}/{ENV_ID}/config/{ELEMENTS_CONFIG_ID}/operation_approval"
+  url = f"https://api.permit.io/v2/elements/{PROJECT_ID}/{ENV_ID}/config/{OPERATION_ELEMENTS_CONFIG_ID}/operation_approval"
   payload = {
       "access_request_details": {
-          "tenant": "default",
+          "tenant": TENANT,
           "resource": "restaurants",
           "resource_instance": restaurant[0],
       },
       "reason": f"User {username} requests approval to order {dish_name}"
   }
   headers = {
-      "authorization": "Bearer YOUR_API_SECRET_KEY",
+    "authorization": f"Bearer {login.element_bearer_token}",
+    "Content-Type": "application/json",
+  }
+  async with httpx.AsyncClient() as client:
+    response = await client.post(url, json=payload, headers=headers)
+
+    if response.status_code >= 200 and response.status_code < 300:
+      return "Your request has been successfully sent. Please check back later."
+    else:
+      return f"Request failed with status code {response.status_code}: {response.text}"
+
+
+@mcp.tool()
+async def list_pending_restaurant_request(username: str, restaurant_name: str) -> dict:
+  """
+  Lists the pending requests to access a restaurant in order to be able to view it's dishes.
+
+  Args:
+    username: The username of the current user.
+    restaurant_name: The name of the restaurant whose pending access requests are to be listed.
+  """
+
+  username = username.lower()  
+  restaurant = await get_restaurant_by_name(restaurant_name)
+  if not restaurant:
+    return "Restaurant not found."
+    
+  url = f"https://api.permit.io/v2/facts/{PROJECT_ID}/{ENV_ID}/access_requests/{ACCESS_ELEMENTS_CONFIG_ID}/user/{username}/tenant/{TENANT}?resource_instance_id={restaurant['id']}"
+  headers = {
+      "authorization": f"Bearer {PERMIT_API_KEY}",
       "Content-Type": "application/json",
   }
   async with httpx.AsyncClient() as client:
-      await client.post(url, json=payload, headers=headers)
-      return 'You request has been successfully sent. Please check back later.'
+    response = await client.get(url, headers=headers)
+    if response.status_code >= 200 and response.status_code < 300:
+      string_data = response.content.decode('utf-8')
+      data = json.loads(string_data)
+      filtered_data = [
+        {
+            "access_request_id": item["id"],
+            "reason": item["reason"]
+        }
+        for item in data['data']
+        if item['status'] == 'pending'
+      ]
+      
+      return filtered_data
+    else:
+      return f"Request failed with status code {response.status_code}: {response.text} {restaurant['id']}"
+
+
+@mcp.tool()
+async def list_pending_dish_request(username: str, restaurant_name: str) -> List[dict]:
+  """
+  Lists the pending one-time operation requests sent for permission to order a dish.
+
+  Args:
+    username: The username of the current user.
+    restaurant_name: The name of the restaurant whose pending dish requests are to be listed.
+  """
+
+  username = username.lower()
+  login = await permit.elements.login_as(username, TENANT)
+
+  restaurant = await get_restaurant_by_name(restaurant_name)
+  if not restaurant:
+    return "Restaurant not found."
+  
+  url = f"https://api.permit.io/v2/elements/{PROJECT_ID}/{ENV_ID}/config/{OPERATION_ELEMENTS_CONFIG_ID}/operation_approval?element_id={OPERATION_ELEMENTS_CONFIG_ID}&resource=restaurants&status=pending&resource_instance={restaurant['id']}"
+  headers = {
+    "authorization": f"Bearer {login.element_bearer_token}",
+    "Content-Type": "application/json",
+  }
+  async with httpx.AsyncClient() as client:
+    response = await client.get(url, headers=headers)
+    if response.status_code >= 200 and response.status_code < 300:
+      string_data = response.content.decode('utf-8')
+      data = json.loads(string_data)
+      filtered_data = [
+        {
+            "access_request_id": item["id"],
+            "reason": item["reason"]
+        }
+        for item in data['data']
+        if item['status'] == 'pending'
+      ]
+      
+      return filtered_data
+    else:
+      return f"Request failed with status code {response.status_code}: {response.text}"
+
+
+@mcp.tool()
+async def approve_restaurant_access(username, access_request_id) -> dict:
+  """
+  Approve a pending restaurant access request.
+
+  Args:
+    username: The username of the current user.
+    access_request_id: The ID of the access request which can be gotten from listing the pending access requests.
+  """
+  url = f"https://api.permit.io/v2/facts/{PROJECT_ID}/{ENV_ID}/access_requests/{ACCESS_ELEMENTS_CONFIG_ID}/user/{username}/tenant/{TENANT}/{access_request_id}/approve"
+  payload = {
+    "reviewer_comment": "grown up child",
+    "role": "child-can-order"
+  }
+  headers = {
+    "authorization": f"Bearer {PERMIT_API_KEY}",
+    "Content-Type": "application/json",
+  }
+  async with httpx.AsyncClient() as client:
+    response = await client.put(url, json=payload, headers=headers)
+
+    if response.status_code >= 200 and response.status_code < 300:
+      return "Access has been granted"
+    else:
+      return f"Request failed with status code {response.status_code}: {response.text}"
+
+
+@mcp.tool()
+async def approve_opeartion_request(username, operation_approval_id) -> dict:
+  """
+  Approve a pending one-time operation request.
+
+  Args:
+    username: The username of the current user.
+    operation_approval_id: The ID of the operation requet which can be gotten from listing the pending operation requests.
+  """
+  
+  login = await permit.elements.login_as(username, TENANT)
+  
+  url = f"https://api.permit.io/v2/elements/{PROJECT_ID}/{ENV_ID}/config/{OPERATION_ELEMENTS_CONFIG_ID}/operation_approval/{operation_approval_id}/approve"
+  payload = {
+    "reviewer_comment": "transfer for a new client"
+  }
+  headers = {
+    "authorization": f"Bearer {login.element_bearer_token}",
+    "Content-Type": "application/json",
+  }
+  async with httpx.AsyncClient() as client:
+    response = await client.put(url, json=payload, headers=headers)
+    if response.status_code >= 200 and response.status_code < 300:
+      return "Access has been granted"
+    else:
+      return f"Request failed with status code {response.status_code}: {response.text} {login.element_bearer_token}"
 
 
 if __name__ == "__main__":
   asyncio.run(init_db())
   mcp.run(transport="stdio")
-
-  
